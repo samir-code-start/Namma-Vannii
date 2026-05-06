@@ -34,7 +34,7 @@ def translate_to_english(text: str) -> str:
 # ---------------------------------------------------------------------------
 MOCK_MODE: bool = os.getenv("MOCK_MODE", "False").lower() == "true"
 SARVAM_API_KEY: str | None = os.getenv("SARVAM_API_KEY")
-SARVAM_URL = "https://api.sarvam.ai/transcription/kannada-english-hindi/v1"
+SARVAM_URL = "https://api.sarvam.ai/speech-to-text"
 LLM_MODEL = "llama-3.3-70b-versatile"
 SARVAM_LLM_URL = "https://api.sarvam.ai/inference/chat/completions"
 
@@ -118,7 +118,7 @@ def _sarvam_chat(messages: list, temperature: float = 0.1, max_tokens: int = 500
         SARVAM_LLM_URL,
         headers={
             "Content-Type": "application/json",
-            "subscription-key": SARVAM_API_KEY,
+            "api-subscription-key": SARVAM_API_KEY,
         },
         json={
             "model": LLM_MODEL,
@@ -261,7 +261,7 @@ def transcribe_audio(audio_path: str) -> tuple[str, str]:
             res = requests.post(
                 SARVAM_URL,
                 files={"file": ("audio.wav", f, "audio/wav")},
-                headers={"subscription-key": SARVAM_API_KEY},
+                headers={"api-subscription-key": SARVAM_API_KEY},
                 timeout=15,
             )
 
