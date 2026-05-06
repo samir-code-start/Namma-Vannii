@@ -11,7 +11,6 @@ import requests
 from datetime import datetime
 
 import edge_tts
-from openai import OpenAI
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -24,12 +23,10 @@ def translate_to_english(text: str) -> str:
     """Translates any text to English via Sarvam LLM. Safe fallback to original."""
     if not text.strip(): return ""
     try:
-        res = sarvam_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+        return _sarvam_chat(
             messages=[{"role": "user", "content": f"Translate to English ONLY: '{text}'"}],
-            temperature=0.1, max_tokens=100
+            temperature=0.1, max_tokens=100,
         )
-        return res.choices[0].message.content.strip()
     except Exception: return text  # Fail-safe
 
 # ---------------------------------------------------------------------------
@@ -39,12 +36,7 @@ MOCK_MODE: bool = os.getenv("MOCK_MODE", "False").lower() == "true"
 SARVAM_API_KEY: str | None = os.getenv("SARVAM_API_KEY")
 SARVAM_URL = "https://api.sarvam.ai/transcription/kannada-english-hindi/v1"
 LLM_MODEL = "llama-3.3-70b-versatile"
-
-# Sarvam Chat Client (OpenAI-compatible)
-sarvam_client = OpenAI(
-    api_key=os.getenv("SARVAM_API_KEY"),
-    base_url="https://api.sarvam.ai/inference/chat/completions",
-)
+SARVAM_LLM_URL = "https://api.sarvam.ai/inference/chat/completions"
 
 KANADA_FIXES = {
     "ನಮ್ವ": "ನಮ್ಮ",
@@ -117,8 +109,28 @@ GUARDRAILS:
 - If sentiment in [distressed, angry] -> handover=true"""
 
 # ---------------------------------------------------------------------------
-# Sarvam client (configured above at module level)
+# Sarvam LLM helper (direct HTTP via subscription-key)
 # ---------------------------------------------------------------------------
+
+def _sarvam_chat(messages: list, temperature: float = 0.1, max_tokens: int = 500) -> str:
+    """Make a chat completion call to Sarvam AI LLM endpoint using subscription-key."""
+    res = requests.post(
+        SARVAM_LLM_URL,
+        headers={
+            "Content-Type": "application/json",
+            "subscription-key": SARVAM_API_KEY,
+        },
+        json={
+            "model": LLM_MODEL,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        },
+        timeout=30,
+    )
+    res.raise_for_status()
+    data = res.json()
+    return data["choices"][0]["message"]["content"].strip()
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -204,12 +216,11 @@ def parse_confirmation(transcript: str) -> dict:
         # Longer/mixed input → route to quick LLM intent extraction
         try:
             system = "You are a helpline assistant. Respond ONLY with JSON: {\"intent\":\"confirmed\"|\"denied\"|\"unclear\",\"summary\":\"one-line clarification of user's exact meaning\"}. Analyze this spoken reply:"
-            res = sarvam_client.chat.completions.create(
-                model=LLM_MODEL,
+            raw = _sarvam_chat(
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": t}],
                 temperature=0.1, max_tokens=80,
             )
-            m = re.search(r'\{.*\}', res.choices[0].message.content, re.DOTALL)
+            m = re.search(r'\{.*\}', raw, re.DOTALL)
             if m: return json.loads(m.group())
         except Exception: pass
         return {"intent": "unclear", "summary": t[:80]}
@@ -250,7 +261,7 @@ def transcribe_audio(audio_path: str) -> tuple[str, str]:
             res = requests.post(
                 SARVAM_URL,
                 files={"file": ("audio.wav", f, "audio/wav")},
-                headers={"subscription-key": os.getenv("SARVAM_API_KEY")},
+                headers={"subscription-key": SARVAM_API_KEY},
                 timeout=15,
             )
 
@@ -292,13 +303,7 @@ def analyze_transcript(text: str) -> dict:
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": f"CITIZEN TRANSCRIPT: '{text}'"}
         ]
-        res = sarvam_client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=messages,
-            temperature=0.1,
-            max_tokens=500,
-        )
-        raw = res.choices[0].message.content.strip()
+        raw = _sarvam_chat(messages=messages, temperature=0.1, max_tokens=500)
         clean_raw = _strip_fences(raw)
         parsed = extract_json(clean_raw)
         return _enforce_guardrails(parsed)
