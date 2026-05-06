@@ -1,0 +1,163 @@
+# Namma Vanni — Optimization & Accuracy Plan
+
+## Current Pipeline vs Problem Statement Gap Analysis
+
+| # | Requirement | Status | Gap |
+|---|------------|:------:|-----|
+| 1 | Voice-to-Voice (Kn/Hi/En) | ✅ | Working but TTS uses Edge (Microsoft), not Indic-native |
+| 2 | Verification of Understanding | ⚠️ | Only Yes/No — **missing "partially correct"** |
+| 3 | Learning from Feedback | ⚠️ | CSV-only — no feedback→prompt loop |
+| 4 | Guardrails & Human Takeover | ✅ | Solid — confidence + sentiment triggers |
+| 5 | Dialect & Cultural Understanding | ❌ | Only static word-replace dictionaries |
+| 6 | Sentiment & Emotional Awareness | ⚠️ | Missing **"fear"** from the 6 required emotions |
+| 7 | Human-in-the-Loop Control | ⚠️ | Agent notes exist but corrections don't feed back |
+
+---
+
+## 🔴 High-Impact Optimizations (Should Implement)
+
+### 1. Use Sarvam `/text-to-speech` instead of Edge TTS
+**Why:** The problem says *"voice-to-voice"* in the citizen's language. Edge TTS speaks English/Indic with a Microsoft accent. Sarvam's TTS has native Indian language voices — much more natural for a Kannada/Hindi citizen.
+
+**API:**
+```
+POST https://api.sarvam.ai/text-to-speech
+Header: api-subscription-key: <key>
+Body: { "text": "...", "target_language_code": "kn-IN", "speaker": "meera" }
+```
+
+**Impact:** Verification prompt plays back in the citizen's own language with a natural Indian voice. Huge UX win for the hackathon.
+
+---
+
+### 2. Translate Verification Prompt to Citizen's Language
+**Why:** Currently the LLM generates the verification prompt in **English only**. A Kannada-speaking citizen hears English playback — this breaks the "voice-to-voice in their language" requirement.
+
+**Flow:**
+```
+LLM generates English verification → Sarvam /translate → Kannada/Hindi text → Sarvam TTS → Audio in citizen's language
+```
+
+**API:**
+```
+POST https://api.sarvam.ai/translate
+Body: { "input": "Your road is damaged...", "source_language_code": "en-IN", "target_language_code": "kn-IN" }
+```
+
+**Impact:** Citizen hears verification in their own language. Directly addresses the core problem.
+
+---
+
+### 3. Add "Partially Correct" to Verification Flow
+**Why:** Problem statement explicitly says capture: *correct / partially correct / incorrect*. Current system only has Yes/No/Unclear.
+
+**Change:**
+- Update `parse_confirmation()` to detect phrases like *"yes but..."*, *"almost"*, *"haan par..."*, *"mostly right"*
+- Add `"partial"` intent → re-record with the partial context preserved
+- LLM refinement call: "The citizen said 'partially correct' and added: '...'. Refine your analysis."
+
+**Impact:** Matches the judging criteria exactly. Shows the system learns from partial feedback.
+
+---
+
+### 4. Add "Fear" to Sentiment Detection
+**Why:** Problem statement lists 6 emotions: distress, urgency, anger, **fear**, confusion, calm. Current system only has 5 (no fear).
+
+**Change:** Add `"fear"` to `_VALID_SENTIMENTS` and update the LLM system prompt.
+
+**Impact:** Small change, direct requirement compliance.
+
+---
+
+### 5. Enhanced System Prompt with Dialect Awareness
+**Why:** Requirement #5 demands dialect/cultural understanding. Current prompt has zero dialect awareness.
+
+**Add to system prompt:**
+```
+DIALECT AWARENESS:
+- North Karnataka dialects: "enu" → "ēnu" (what), "barri" → "banni" (come)
+- Bangalore Urban: Code-mixed Kannada-English
+- Old Mysuru: Formal Kannada with "appa/amma" honorifics
+- Hindi-belt migrants: Hinglish mixed with Kannada words
+- Recognize colloquial expressions: "current hogide" = power cut, "neer bandilla" = no water
+```
+
+**Impact:** Directly addresses requirement #5. Shows judges you thought about real Karnataka dialects.
+
+---
+
+### 6. Dual Transcript Display (Original + English)
+**Why:** The Sarvam `/speech-to-text` endpoint gives the **original language** transcript. The `/speech-to-text-translate` gives English. Call BOTH — show original to agent (for verification) and English to AI (for analysis).
+
+**Flow:**
+```
+Audio → Sarvam /speech-to-text → Original Kannada text (display to agent)
+Audio → Sarvam /speech-to-text-translate → English text (feed to LLM)
+```
+
+**Impact:** Agent sees what the citizen actually said in their language. Massive credibility for human-in-the-loop.
+
+---
+
+## 🟡 Medium-Impact (Nice to Have)
+
+### 7. Sarvam `/language-detection` as Pre-Filter
+Call `/language-detection` on the raw audio text to confirm the detected language before routing TTS voice. Adds robustness.
+
+### 8. Retry Flow with Context Preservation
+When citizen says "No" (denied), currently starts over. Instead:
+- Keep the partial context
+- Re-record only
+- Send to LLM: *"Previous attempt was denied. Citizen's correction: '...'. Re-analyze."*
+
+### 9. Confidence-Weighted Feedback Storage
+Log feedback with weights:
+- Confirmed with high confidence → strong positive signal
+- Denied → negative signal with correction
+- Partial → weak signal with amendment
+
+This creates a structured dataset for future fine-tuning.
+
+### 10. Karnataka Civic Issue Taxonomy
+Add a hardcoded domain taxonomy to the prompt for better classification:
+
+```
+ISSUE CATEGORIES (Karnataka 1092):
+- ROAD: potholes, damaged roads, flooding
+- WATER: supply disruption, contamination, leakage  
+- ELECTRICITY: power cuts, street lights, transformer
+- GARBAGE: collection, dumping, burning
+- DRAINAGE: overflow, blockage, sewage
+- SAFETY: crime, harassment, emergency
+- GOVERNMENT: corruption, missing services, documentation
+```
+
+---
+
+## 🟢 Quick Wins (< 30 min each)
+
+| Change | File | Effort |
+|--------|------|--------|
+| Add `"fear"` sentiment | `engine.py` L140, system prompt | 5 min |
+| Dialect examples in prompt | `engine.py` system prompt | 10 min |
+| Civic taxonomy in prompt | `engine.py` system prompt | 10 min |
+| `partially_correct` intent | `engine.py` + `app.py` | 20 min |
+| Sarvam TTS swap | `engine.py` generate_tts() | 25 min |
+| Sarvam translate for verification | `engine.py` process_audio() | 20 min |
+| Dual transcript (original + English) | `engine.py` transcribe_audio() | 25 min |
+
+---
+
+## Recommended Priority Order
+
+```
+1. Add "fear" sentiment + dialect/taxonomy prompt  (15 min) — Quick compliance wins
+2. Sarvam TTS for native voice playback           (25 min) — Core differentiator
+3. Sarvam translate for verification prompt        (20 min) — Voice-to-voice completeness
+4. "Partially correct" intent flow                 (20 min) — Judging criteria match
+5. Dual transcript display                         (25 min) — Human-in-the-loop showcase
+6. Retry with context preservation                 (20 min) — Learning from feedback
+```
+
+> [!TIP]
+> Items 1-4 alone would cover **all 7 requirements** in the problem statement and can be done in ~80 minutes.

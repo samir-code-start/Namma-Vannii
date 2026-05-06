@@ -1,0 +1,135 @@
+AI for 1092 Helpline
+
+Context
+
+The Department of Personnel and Administrative Reforms (e-Governance), Government ofKarnataka operates 1092, where citizens call to report issues, seek help, or escalateconcerns.
+
+These interactions are often:
+
+Multilingual (Kannada, Hindi, English)
+Dialect-rich (regional and local variations)
+Emotionally charged (distress, urgency, confusion)
+Handled by agents who may be comfortable in only one language
+In such situations, the biggest challenge is not just communication—but correctunderstanding before response.
+
+Misunderstanding a citizen’s issue can lead to delays, incorrect actions, or poor serviceoutcomes.
+
+ 
+
+Problem Statement
+
+Build an AI-assisted voice-to-voice system for the 1092 helpline that ensures accurateunderstanding of citizen issues before enabling response.The system should help bridge gaps across:
+
+Language (Kannada, Hindi, English)
+Dialects and cultural expressions
+Sentiment and emotional context
+The AI must act as an assistive layer, ensuring that:
+
+the citizen is understood correctly
+the understanding is verified explicitly
+and when needed, the system safely hands over control to the human agent
+ 
+
+Core Objective
+
+Enable real-time or near real-time voice-to-voice assistance where:
+
+A citizen speaks naturally in their own language or dialect
+The system interprets the message with sensitivity to:
+language
+dialect
+cultural context
+sentiment and urgency
+The system attempts to verify its understanding with the citizen
+If confirmed, the system proceeds with confidence
+If not, or if confidence is low, human-led interaction takes over seamlessly
+ 
+
+Key Requirements
+
+1. Voice-to-Voice Communication (Primary Focus)
+
+Support natural spoken interaction between citizen and agent
+Assist communication across Kannada, Hindi, and English
+Maintain low latency suitable for live call environments
+2. Verification of Understanding
+
+The system must:
+
+Restate or summarize the citizen’s issue
+Seek confirmation from the citizen
+Capture whether the interpretation was:
+correct
+partially correct
+incorrect
+This step is critical, as correct understanding is more important than speed.
+
+3. Learning from Feedback
+
+Confirmed interpretations become validated learning signals
+Corrections by citizen or agent should be captured for improvement
+The system should demonstrate a path for continuous learning
+4. Guardrails & Human Takeover
+
+The system must ensure smooth escalation when:
+
+confidence is low
+repeated misunderstanding occurs
+high distress or urgency is detected
+In such cases:
+
+the AI should step back gracefully
+the interaction should become fully human-led without friction
+5. Dialect & Cultural Understanding
+
+The system should:
+
+Recognize or infer dialect variations
+Handle local expressions and colloquial usage
+Account for differences in tone, formality, and phrasing
+6. Sentiment & Emotional Awareness
+
+The system should detect:
+
+distress
+urgency
+anger
+fear
+confusion
+neutral or calm states
+These signals should assist the agent in responding appropriately.
+
+7. Human-in-the-Loop ControlAgents should be able to:
+
+review AI interpretations
+edit or correct them
+validate sentiment and context
+These corrections should feed into future improvements.
+
+ 
+
+Scope for the Hackathon
+
+LanguagesTeams may build solutions supporting:
+
+Kannada
+Hindi
+English
+Solutions should be designed to extend to other Indian languages in the future.
+
+ 
+
+Primary Focus
+
+Voice-to-voice communication
+Verified understanding
+Dialect and sentiment-aware interpretation
+Safe human takeover
+ 
+
+Secondary (For later)
+
+Speech-to-text transcripts
+Structured summaries of calls
+Searchable records
+Knowledge base for future efficiency

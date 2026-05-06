@@ -34,9 +34,10 @@ def translate_to_english(text: str) -> str:
 # ---------------------------------------------------------------------------
 MOCK_MODE: bool = os.getenv("MOCK_MODE", "False").lower() == "true"
 SARVAM_API_KEY: str | None = os.getenv("SARVAM_API_KEY")
-SARVAM_URL = "https://api.sarvam.ai/speech-to-text"
+SARVAM_STT_URL = "https://api.sarvam.ai/speech-to-text-translate"
+GROQ_API_KEY: str | None = os.getenv("GROQ_API_KEY")
 LLM_MODEL = "llama-3.3-70b-versatile"
-SARVAM_LLM_URL = "https://api.sarvam.ai/inference/chat/completions"
+GROQ_LLM_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 KANADA_FIXES = {
     "ನಮ್ವ": "ನಮ್ಮ",
@@ -53,7 +54,7 @@ FEEDBACK_FILE = "feedback.csv"
 FEEDBACK_HEADERS = [
     "timestamp", "language", "raw_text", "ai_issue",
     "confidence", "sentiment", "citizen_response",
-    "agent_correction", "handover",
+    "agent_correction", "handover", "feedback_weight",
 ]
 
 TTS_VOICE_MAP: dict[str, str] = {
@@ -63,6 +64,16 @@ TTS_VOICE_MAP: dict[str, str] = {
 }
 TTS_FALLBACK_VOICE = "en-IN-NeerjaNeural"
 TTS_OUTPUT_PATH = "verify.mp3"
+
+# Sarvam TTS & Translate config
+SARVAM_TTS_URL = "https://api.sarvam.ai/text-to-speech"
+SARVAM_TRANSLATE_URL = "https://api.sarvam.ai/translate"
+SARVAM_STT_ORIGINAL_URL = "https://api.sarvam.ai/speech-to-text"
+SARVAM_TTS_LANG_MAP = {
+    "kn": "kn-IN",
+    "hi": "hi-IN",
+    "en": "en-IN",
+}
 
 # ---------------------------------------------------------------------------
 # Mock payloads
@@ -98,27 +109,46 @@ OUTPUT STRICT JSON ONLY:
 {
   "language": "en|kn|hi",
   "confidence": 0.0-1.0,
-  "sentiment": "calm|confused|urgent|distressed|angry",
+  "sentiment": "calm|confused|urgent|distressed|angry|fear",
   "normalized_issue": "Clean 1-line summary",
   "verification_prompt": "Natural question clarifying the specific issue. End with: 'Did I understand correctly? Say Yes or No.' Max 20 words.",
   "handover": true|false
 }
 
+DIALECT AWARENESS (Karnataka):
+- North Karnataka dialects: "enu" → "ēnu" (what), "barri" → "banni" (come)
+- Bangalore Urban: Code-mixed Kannada-English ("current hogide" = power cut)
+- Old Mysuru: Formal Kannada with "appa/amma" honorifics
+- Hindi-belt migrants: Hinglish mixed with Kannada words
+- Common civic expressions:
+  "current hogide" = power cut, "neer bandilla" = no water supply
+  "gutter overflow" = drainage blockage, "kasa collect aagilla" = garbage not collected
+  "road kharab" = road damaged, "light illa" = no street light
+
+ISSUE CATEGORIES (Karnataka 1092):
+- ROAD: potholes, damaged roads, flooding, waterlogging
+- WATER: supply disruption, contamination, leakage, bore well
+- ELECTRICITY: power cuts, street lights, transformer failure
+- GARBAGE: collection missed, illegal dumping, burning
+- DRAINAGE: overflow, blockage, sewage leak
+- SAFETY: crime, harassment, emergency, accidents
+- GOVERNMENT: corruption, missing services, documentation issues
+
 GUARDRAILS:
 - If confidence < 0.7 -> handover=true
-- If sentiment in [distressed, angry] -> handover=true"""
+- If sentiment in [distressed, angry, fear] -> handover=true"""
 
 # ---------------------------------------------------------------------------
-# Sarvam LLM helper (direct HTTP via subscription-key)
+# Groq LLM helper (OpenAI-compatible API with Bearer token)
 # ---------------------------------------------------------------------------
 
 def _sarvam_chat(messages: list, temperature: float = 0.1, max_tokens: int = 500) -> str:
-    """Make a chat completion call to Sarvam AI LLM endpoint using subscription-key."""
+    """Make a chat completion call to Groq LLM endpoint (llama-3.3-70b-versatile)."""
     res = requests.post(
-        SARVAM_LLM_URL,
+        GROQ_LLM_URL,
         headers={
             "Content-Type": "application/json",
-            "api-subscription-key": SARVAM_API_KEY,
+            "Authorization": f"Bearer {GROQ_API_KEY}",
         },
         json={
             "model": LLM_MODEL,
@@ -136,7 +166,7 @@ def _sarvam_chat(messages: list, temperature: float = 0.1, max_tokens: int = 500
 # Internal helpers
 # ---------------------------------------------------------------------------
 _VALID_LANGUAGES = {"kn", "hi", "en"}
-_VALID_SENTIMENTS = {"calm", "confused", "urgent", "distressed", "angry"}
+_VALID_SENTIMENTS = {"calm", "confused", "urgent", "distressed", "angry", "fear"}
 
 def _strip_fences(raw: str) -> str:
     """Remove markdown/code fences from a raw string."""
@@ -172,7 +202,7 @@ def _enforce_guardrails(data: dict) -> dict:
     handover: bool = bool(data.get("handover", False))
     if confidence < 0.7:
         handover = True
-    elif sentiment in {"distressed", "angry"} or normalized_issue == "Unclear report. Needs agent clarification.":
+    elif sentiment in {"distressed", "angry", "fear"} or normalized_issue == "Unclear report. Needs agent clarification.":
         handover = True
 
     return {
@@ -207,6 +237,15 @@ def parse_confirmation(transcript: str) -> dict:
                 
     yes_hits = [w for w in yes_tokens if w in t]
     no_hits = [w for w in no_tokens if w in t]
+    # Partial-correct patterns ("yes but...", "almost", "haan par...")
+    partial_tokens = ["but","almost","mostly","partially","partly","half","kinda","sort of",
+                      "not fully","not exactly","haan par","haan lekin","sari aadre","yes but",
+                      "thoda","kuch","aadre"]
+    partial_hits = [w for w in partial_tokens if w in t]
+    
+    # Check partial FIRST ("yes but..." should be partial, not confirmed)
+    if len(partial_hits) > 0 and len(yes_hits) > 0:
+        return {"intent": "partial", "summary": t[:80]}
     
     if len(yes_hits) > 0 and len(no_hits) == 0:
         return {"intent": "confirmed", "summary": t[:80]}
@@ -215,7 +254,7 @@ def parse_confirmation(transcript: str) -> dict:
     if len(t) > 20 or (len(yes_hits) > 0 and len(no_hits) > 0):
         # Longer/mixed input → route to quick LLM intent extraction
         try:
-            system = "You are a helpline assistant. Respond ONLY with JSON: {\"intent\":\"confirmed\"|\"denied\"|\"unclear\",\"summary\":\"one-line clarification of user's exact meaning\"}. Analyze this spoken reply:"
+            system = "You are a helpline assistant. Respond ONLY with JSON: {\"intent\":\"confirmed\"|\"denied\"|\"partial\"|\"unclear\",\"summary\":\"one-line clarification of user's exact meaning\"}. 'partial' means the citizen said something like 'yes but...' or 'almost correct'. Analyze this spoken reply:"
             raw = _sarvam_chat(
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": t}],
                 temperature=0.1, max_tokens=80,
@@ -245,44 +284,47 @@ def normalize_transcript(text: str, lang: str) -> str:
     for k, v in current.items(): out = out.replace(k, v)
     return out.strip().replace("  ", " ").replace("\n", " ")
 
-def transcribe_audio(audio_path: str) -> tuple[str, str]:
-    """Single-layer transcription using Sarvam Hindi/Kannada/English model."""
+def transcribe_audio(audio_path: str) -> tuple[str, str, str]:
+    """Returns (english_text, detected_language_code, original_transcript).
+    
+    original_transcript: raw text in citizen's language via Sarvam /speech-to-text (non-translate).
+    Falls back to empty string if Sarvam STT original fails.
+    """
     # Mock Mode Check
     if os.getenv("MOCK_MODE", "").lower() == "true":
-        return normalize_transcript("ನಮ್ಮ ಊರಿ ರಸ್ತೆ ತುಂಬಾ ಕೆಟ್ಟಿದೆ, ಅಧಿಕಾರಿಗಳನ್ನು ಕಳುಹಿಸಿ", "kn"), "kn"
+        return "The road in our village is very bad, please send officials", "kn", _MOCK_TRANSCRIPT
 
-    print(f"[STT] Transcribing via Sarvam: {audio_path}", flush=True)
+    print(f"[STT] Transcribing+translating via Sarvam: {audio_path}", flush=True)
     if not os.path.isfile(audio_path) or os.path.getsize(audio_path) < 50:
-        return "", "en"
+        return "", "en", ""
 
     try:
         with open(audio_path, "rb") as f:
-            # Sarvam's Indic model endpoint
             res = requests.post(
-                SARVAM_URL,
+                SARVAM_STT_URL,
                 files={"file": ("audio.wav", f, "audio/wav")},
                 headers={"api-subscription-key": SARVAM_API_KEY},
-                timeout=15,
+                timeout=20,
             )
 
         res.raise_for_status()
-        data = res.json().get("data") or res.json()
-        raw_text = (data.get("text") or data.get("transcript") or "").strip()
+        data = res.json()
+        # The translate endpoint returns English text directly
+        english_text = (data.get("transcript") or data.get("text") or "").strip()
 
-        # Language Routing & Validation
-        raw_lang = (data.get("detected_language") or data.get("language") or "kn-IN").split("-")[0][:2]
-        clean = normalize_transcript(raw_text, raw_lang)
+        # Detect original language for TTS voice routing
+        raw_lang = (data.get("language_code") or data.get("detected_language") or "kn").split("-")[0][:2]
+        if raw_lang not in _VALID_LANGUAGES:
+            raw_lang = "kn"
 
-        # Force Kannada/Hindi routing if Unicode detected
-        if any(ord(c) > 127 for c in raw_text):
-            raw_lang = "kn" if any(chr(2400) <= ord(c) <= chr(2815) for c in raw_text) else "hi"
+        original_text = _sarvam_stt_original(audio_path)
 
-        print(f"[STT SARVAM SUCCESS] Lang: {raw_lang} | Len: {len(clean)}", flush=True)
-        return clean, raw_lang
+        print(f"[STT+TRANSLATE SUCCESS] Lang: {raw_lang} | Len: {len(english_text)}", flush=True)
+        return english_text, raw_lang, original_text
 
     except Exception as e:
         print(f"[STT ERROR] Sarvam Failed: {e}", flush=True)
-        return "", "en"  # Graceful failure to English if Sarvam is down
+        return "", "en", ""  # Graceful failure
 
 def extract_json(text: str) -> dict:
     match = re.search(r'\{.*\}', text, re.DOTALL)
@@ -318,17 +360,130 @@ def analyze_transcript(text: str) -> dict:
             "handover": True,
         })
 
+def re_analyze_transcript(new_text: str, previous_analysis: dict, feedback_type: str = "denied") -> dict:
+    """Re-analyze with context from a previous denied/partial attempt.
+    
+    Args:
+        new_text: New citizen transcript (English).
+        previous_analysis: Previous ai_data dict that was rejected/partial.
+        feedback_type: "denied" or "partial" — changes the LLM context framing.
+    """
+    if MOCK_MODE:
+        return _MOCK_ANALYSIS
+
+    prev_issue = previous_analysis.get("normalized_issue", "")
+    if feedback_type == "partial":
+        context = (
+            f"Previous AI analysis was PARTIALLY CORRECT. "
+            f"Previous AI summary: '{prev_issue}'. "
+            f"Citizen's clarification/correction: '{new_text}'. "
+            f"Refine the analysis incorporating the citizen's feedback. "
+            f"Keep what was correct and fix what was wrong."
+        )
+    else:
+        context = (
+            f"Previous AI analysis was DENIED by the citizen. "
+            f"Previous AI summary: '{prev_issue}'. "
+            f"Citizen's new recording/correction: '{new_text}'. "
+            f"Re-analyze from scratch incorporating the citizen's feedback."
+        )
+
+    logging.info(f"[RE-ANALYZE] Type: {feedback_type} | New input: {new_text[:60]}")
+    try:
+        messages = [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": context},
+        ]
+        raw = _sarvam_chat(messages=messages, temperature=0.1, max_tokens=500)
+        parsed = extract_json(_strip_fences(raw))
+        return _enforce_guardrails(parsed)
+    except Exception as e:
+        logging.error(f"[RE-ANALYZE FAIL] {e}")
+        return _enforce_guardrails({
+            "language": previous_analysis.get("language", "en"),
+            "normalized_issue": prev_issue or "Unable to re-analyze. Needs agent.",
+            "confidence": 0.3,
+            "sentiment": "confused",
+            "verification_prompt": "I'm still having trouble understanding. Could you explain once more?",
+            "handover": True,
+        })
+
+def _sarvam_tts(text: str, lang: str) -> bytes | None:
+    """Call Sarvam TTS API. Returns audio bytes or None on failure."""
+    target_lang = SARVAM_TTS_LANG_MAP.get(lang.lower().strip(), "en-IN")
+    try:
+        res = requests.post(
+            SARVAM_TTS_URL,
+            headers={
+                "Content-Type": "application/json",
+                "api-subscription-key": SARVAM_API_KEY,
+            },
+            json={
+                "inputs": [text],
+                "target_language_code": target_lang,
+                "speaker": "meera",
+                "model": "bulbul:v2",
+            },
+            timeout=20,
+        )
+        res.raise_for_status()
+        data = res.json()
+        # Response contains base64 audio
+        import base64
+        audio_b64 = data.get("audios", [None])[0]
+        if audio_b64:
+            logger.info("[SARVAM TTS] Success for lang=%s", target_lang)
+            return base64.b64decode(audio_b64)
+    except Exception as e:
+        logger.warning("[SARVAM TTS] Failed: %s — will fallback to Edge TTS", e)
+    return None
+
+def _sarvam_translate(text: str, source_lang: str, target_lang: str) -> str:
+    """Translate text via Sarvam /translate API. Returns translated text or original on failure."""
+    try:
+        res = requests.post(
+            SARVAM_TRANSLATE_URL,
+            headers={
+                "Content-Type": "application/json",
+                "api-subscription-key": SARVAM_API_KEY,
+            },
+            json={
+                "input": text,
+                "source_language_code": source_lang,
+                "target_language_code": target_lang,
+            },
+            timeout=15,
+        )
+        res.raise_for_status()
+        translated = res.json().get("translated_text", "").strip()
+        if translated:
+            logger.info("[SARVAM TRANSLATE] %s -> %s OK", source_lang, target_lang)
+            return translated
+    except Exception as e:
+        logger.warning("[SARVAM TRANSLATE] Failed: %s — returning original", e)
+    return text  # Fail-safe: return original
+
 def generate_tts(text: str, lang: str) -> str:
-    """Synthesise verification prompt to verify.mp3 via edge-tts; returns file path."""
+    """Synthesise verification prompt via Sarvam TTS (primary) or Edge TTS (fallback)."""
     if MOCK_MODE:
         logger.info("[MOCK] generate_tts() -> writing stub verify.mp3.")
         with open(TTS_OUTPUT_PATH, "wb") as f:
             f.write(b"")  # zero-byte stub
         return TTS_OUTPUT_PATH
 
-    voice = TTS_VOICE_MAP.get(lang.lower().strip(), TTS_FALLBACK_VOICE)
-    logger.info("TTS: voice=%s, chars=%d", voice, len(text))
+    logger.info("TTS: lang=%s, chars=%d", lang, len(text))
 
+    # Try Sarvam TTS first (native Indian voices)
+    audio_bytes = _sarvam_tts(text, lang)
+    if audio_bytes:
+        with open(TTS_OUTPUT_PATH, "wb") as f:
+            f.write(audio_bytes)
+        logger.info("[SARVAM TTS] Saved to %s", TTS_OUTPUT_PATH)
+        return TTS_OUTPUT_PATH
+
+    # Fallback to Edge TTS
+    logger.info("[EDGE TTS FALLBACK] Trying Edge TTS...")
+    voice = TTS_VOICE_MAP.get(lang.lower().strip(), TTS_FALLBACK_VOICE)
     try:
         try:
             loop = asyncio.get_event_loop()
@@ -354,9 +509,29 @@ def generate_tts(text: str, lang: str) -> str:
             logger.error("TTS fallback also failed: %s", fallback_exc)
             return TTS_OUTPUT_PATH
 
+def _sarvam_stt_original(audio_path: str) -> str:
+    """Get original-language transcript via Sarvam /speech-to-text (non-translate)."""
+    try:
+        with open(audio_path, "rb") as f:
+            res = requests.post(
+                SARVAM_STT_ORIGINAL_URL,
+                files={"file": ("audio.wav", f, "audio/wav")},
+                headers={"api-subscription-key": SARVAM_API_KEY},
+                data={"language_code": "unknown"},
+                timeout=20,
+            )
+        res.raise_for_status()
+        data = res.json()
+        original = (data.get("transcript") or data.get("text") or "").strip()
+        logger.info("[SARVAM STT ORIGINAL] Got %d chars", len(original))
+        return original
+    except Exception as e:
+        logger.warning("[SARVAM STT ORIGINAL] Failed: %s", e)
+        return ""
+
 def process_audio(audio_path: str) -> dict:
     logging.info(f"[PROCESS] Starting for {audio_path}")
-    raw_text, lang = transcribe_audio(audio_path)
+    raw_text, lang, original_text = transcribe_audio(audio_path)
     logging.info(f"[STT OUTPUT] Lang: {lang}, Text Length: {len(raw_text)}")
     
     if not raw_text.strip():
@@ -369,13 +544,25 @@ def process_audio(audio_path: str) -> dict:
             "verification_prompt": "Please try recording again.", 
             "handover": False
         })
-        return {**fallback, "raw_text": "", "verify_tts_path": "verify.mp3"}
+        return {**fallback, "raw_text": "", "original_text": "", "verify_tts_path": "verify.mp3"}
                 
-    english_raw = translate_to_english(raw_text)
-    ai_data = analyze_transcript(english_raw)
-    tts_path = generate_tts(ai_data.get("verification_prompt", ""), ai_data.get("language", "kn"))
+    # raw_text is already English (from speech-to-text-translate)
+    ai_data = analyze_transcript(raw_text)
     
-    final = {**ai_data, "raw_text": english_raw, "verify_tts_path": tts_path}
+    # Phase 5: Translate verification prompt to citizen's language
+    verification_prompt = ai_data.get("verification_prompt", "")
+    citizen_lang = ai_data.get("language", "kn")
+    tts_text = verification_prompt
+    
+    if citizen_lang != "en" and verification_prompt:
+        target_lang_code = SARVAM_TTS_LANG_MAP.get(citizen_lang, "en-IN")
+        translated_prompt = _sarvam_translate(verification_prompt, "en-IN", target_lang_code)
+        ai_data["verification_prompt_translated"] = translated_prompt
+        tts_text = translated_prompt
+    
+    tts_path = generate_tts(tts_text, citizen_lang)
+    
+    final = {**ai_data, "raw_text": raw_text, "original_text": original_text, "verify_tts_path": tts_path}
     logging.info(f"[PIPELINE OK] Confidence: {final['confidence']}, Handover: {final['handover']}")
     return final
 
@@ -388,6 +575,23 @@ def log_feedback(data: dict) -> None:
             if not file_exists:
                 writer.writeheader()
                 logger.info("Created %s with headers.", FEEDBACK_FILE)
+            
+            # Phase 8: Calculate confidence-weighted feedback signal
+            response = data.get("citizen_response", "")
+            try:
+                confidence = float(data.get("confidence", 0.5))
+            except (TypeError, ValueError):
+                confidence = 0.5
+
+            if response == "Confirmed":
+                weight = round(0.5 + (confidence * 0.5), 2)   # 0.5-1.0 strong positive
+            elif response == "Partial":
+                weight = round(0.3 * confidence, 2)            # 0.0-0.3 weak positive
+            elif response == "Handover":
+                weight = round(-0.5 * confidence, 2)           # negative signal
+            else:
+                weight = 0.0
+
             row = {
                 "timestamp": data.get("timestamp", datetime.utcnow().isoformat()),
                 "language": data.get("language", ""),
@@ -398,8 +602,10 @@ def log_feedback(data: dict) -> None:
                 "citizen_response": data.get("citizen_response", ""),
                 "agent_correction": data.get("agent_correction", ""),
                 "handover": data.get("handover", ""),
+                "feedback_weight": weight,
             }
             writer.writerow(row)
-            logger.info("Feedback logged to %s.", FEEDBACK_FILE)
+            logger.info("Feedback logged to %s (weight=%.2f).", FEEDBACK_FILE, weight)
     except Exception as exc:
         logger.error("log_feedback() failed: %s", exc)
+

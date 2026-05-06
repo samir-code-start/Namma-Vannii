@@ -10,6 +10,8 @@ from engine import (
     parse_confirmation,
     process_audio,
     transcribe_audio,
+    re_analyze_transcript,
+    generate_tts,
 )
 
 # ---------------------------------------------------------------------------
@@ -56,6 +58,7 @@ h1, h2, h3, h4, label, p, span, li { font-family: 'Syne', sans-serif !important;
 .emotion-urgent { background:rgba(255,123,84,0.15); color:#ff7b54 !important; border:1px solid rgba(255,123,84,0.25); }
 .emotion-distressed { background:rgba(232,68,90,0.15); color:#e8445a !important; border:1px solid rgba(232,68,90,0.3); }
 .emotion-angry { background:rgba(200,30,30,0.2); color:#ff4444 !important; border:1px solid rgba(200,30,30,0.35); }
+.emotion-fear { background:rgba(138,43,226,0.15); color:#9b59b6 !important; border:1px solid rgba(138,43,226,0.25); }
 .dot-blink::before { content:''; width:6px; height:6px; border-radius:50%; background:currentColor; display:inline-block; animation:blink 1s infinite; }
 @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
 @keyframes pulse-ring { 0%{transform:scale(1);opacity:0.6} 100%{transform:scale(1.4);opacity:0} }
@@ -98,6 +101,7 @@ SENTIMENT_MAP = {
     "urgent": ("emotion-urgent", "🟠", "Urgent"),
     "distressed": ("emotion-distressed", "🔴", "Distressed"),
     "angry": ("emotion-angry", "🟥", "Angry"),
+    "fear": ("emotion-fear", "😨", "Fear"),
 }
 
 def _sentiment_pill(sentiment):
@@ -115,14 +119,22 @@ def _render_header():
     st.markdown('''<div class="nav-bar"><div class="nav-brand-group"><div style="display:flex;align-items:center;gap:12px;"><div class="nav-icon-bg">📞</div><h1 style="margin:0;font-family:'Syne',sans-serif;font-weight:800;font-size:18px;color:var(--text-primary);line-height:1.2;">Namma Vanni — <span style="color:var(--accent-red)">1092</span> AI Helpline</h1></div><p style="margin:6px 0 0 50px;font-size:12px;color:var(--text-secondary);letter-spacing:0.3px;">Voice-to-voice citizen assistant for Karnataka</p></div><div class="nav-badge">LIVE</div></div>''', unsafe_allow_html=True)
 
 def parse_smart_confirmation(transcript: str) -> dict:
-    """Handles conversational Yes/No (e.g., 'Yes you are correct')."""
+    """Handles conversational Yes/No/Partial (e.g., 'Yes but the location is wrong')."""
     t = transcript.strip().lower()
 
     pos_cluster = ["yes", "yeah", "yep", "correct", "right", "okay", "ok", "haan", "hān", "sari", "sha"]
     neg_cluster = ["no", "nahi", "galat", "wrong", "naahi", "illa", "thappilla", "kadliya"]
+    partial_cluster = ["but", "almost", "mostly", "partially", "partly", "not fully",
+                       "not exactly", "haan par", "haan lekin", "sari aadre", "yes but",
+                       "thoda", "kuch", "aadre"]
 
     pos_hits = [w for w in pos_cluster if w in t]
     neg_hits = [w for w in neg_cluster if w in t]
+    partial_hits = [w for w in partial_cluster if w in t]
+
+    # Check partial FIRST ("yes but..." should be partial, not confirmed)
+    if len(partial_hits) > 0 and len(pos_hits) > 0:
+        return {"intent": "partial"}
 
     if len(pos_hits) >= 1 and len(neg_hits) == 0: return {"intent": "confirmed"}
     if len(neg_hits) >= 1 and len(pos_hits) == 0: return {"intent": "denied"}
@@ -221,13 +233,21 @@ elif st.session_state.stage == "verify":
 
     # --- Voice Prompt ---
     base_prompt = data.get("verification_prompt", "")
+    translated_prompt = data.get("verification_prompt_translated", "")
     normalized_issue = data.get("normalized_issue", "")
     appended_prompt = f"{base_prompt} I heard you say '{normalized_issue}'. Is this correct? Say Yes or No."
 
     st.markdown(f'''<div class="card" style="display:flex;gap:12px;align-items:start;">
         <div style="width:32px;height:32px;min-width:32px;background:rgba(96,108,200,0.2);border-radius:8px;display:flex;align-items:center;justify-content:center;">🤖</div>
-        <div><span class="section-label">AI Voice Prompt</span><p style="margin:0;font-style:italic;color:var(--text-secondary) !important;line-height:1.5;">"{appended_prompt}"</p></div>
+        <div><span class="section-label">AI Voice Prompt (English)</span><p style="margin:0;font-style:italic;color:var(--text-secondary) !important;line-height:1.5;">"{appended_prompt}"</p></div>
     </div>''', unsafe_allow_html=True)
+
+    if translated_prompt:
+        lang_label = {"kn": "ಕನ್ನಡ", "hi": "हिन्दी"}.get(lang, lang.upper())
+        st.markdown(f'''<div class="card" style="display:flex;gap:12px;align-items:start;border-left:3px solid var(--accent-blue);">
+            <div style="width:32px;height:32px;min-width:32px;background:rgba(59,138,245,0.2);border-radius:8px;display:flex;align-items:center;justify-content:center;">🗣️</div>
+            <div><span class="section-label">Voice Playback ({lang_label})</span><p style="margin:0;font-style:italic;color:var(--text-primary) !important;line-height:1.5;">"{translated_prompt}"</p></div>
+        </div>''', unsafe_allow_html=True)
 
     # --- PLAYBACK (no key= args to prevent TypeError) ---
     if not tts_path or not os.path.isfile(tts_path):
@@ -243,24 +263,115 @@ elif st.session_state.stage == "verify":
             f.write(conf_audio.getvalue())
 
         with st.spinner("Processing..."):
-            raw_text, _ = transcribe_audio("confirm.wav")
+            raw_text, _, _ = transcribe_audio("confirm.wav")
             result = parse_smart_confirmation(raw_text)
             st.session_state.attempts += 1
 
             if result["intent"] == "confirmed":
                 st.session_state.stage = "agent_ready"
                 st.rerun()
+            elif result["intent"] == "partial":
+                # Partially correct — route to refinement
+                st.session_state.stage = "partial_refine"
+                st.rerun()
             elif result["intent"] == "denied":
                 if st.session_state.attempts >= 2 or data.get("handover", False):
                     st.session_state.stage = "handover"
                     st.rerun()
                 else:
-                    st.warning("Not understood. Please try again.")
+                    # Preserve context, go to re-record
+                    st.session_state.stage = "re_record"
                     st.rerun()
             else:
                 st.markdown(f'''<div class="card" style="border-left:3px solid var(--accent-yellow);"><span class="section-label">AI heard</span><p style="color:var(--text-secondary) !important;margin:0;">"{raw_text[:50]}"</p></div>''', unsafe_allow_html=True)
                 st.warning("Please answer Yes or No clearly.")
                 st.rerun()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# STAGE: partial_refine — citizen said "partially correct"
+# ═══════════════════════════════════════════════════════════════════════════
+elif st.session_state.stage == "partial_refine":
+    data = st.session_state.ai_data or {}
+    if not data:
+        _reset()
+        st.rerun()
+
+    # Show what AI understood
+    st.markdown(f'''<div style="background:rgba(212,160,23,0.08);border:1px solid rgba(212,160,23,0.2);border-radius:12px;padding:14px 18px;margin-bottom:20px;display:flex;align-items:center;gap:8px;">
+        <span style="color:var(--accent-yellow);">🔄</span>
+        <span style="font-size:14px;font-weight:700;color:var(--accent-yellow) !important;">Partially Understood — Please Clarify</span>
+    </div>''', unsafe_allow_html=True)
+
+    st.markdown(f'''<div class="card" style="border-left:3px solid var(--accent-yellow);">
+        <span class="section-label">AI's Current Understanding</span>
+        <h3 style="font-weight:600;margin:4px 0 0 0;">{data.get('normalized_issue', '—')}</h3>
+    </div>''', unsafe_allow_html=True)
+
+    st.markdown('''<div class="card">
+        <span class="section-label">What to do</span>
+        <p style="color:var(--text-secondary) !important;margin:4px 0 0 0;">Please record what was different or incorrect. The AI will refine its understanding.</p>
+    </div>''', unsafe_allow_html=True)
+
+    correction_audio = st.audio_input("🎙️ Record your correction...", key="partial_mic")
+    if correction_audio is not None:
+        with open("correction.wav", "wb") as f:
+            f.write(correction_audio.getvalue())
+
+        with st.spinner("🔄 Refining AI analysis with your correction..."):
+            correction_text, _, _ = transcribe_audio("correction.wav")
+            if correction_text.strip():
+                refined = re_analyze_transcript(correction_text, data, feedback_type="partial")
+                tts_path = generate_tts(refined.get("verification_prompt", ""), refined.get("language", "kn"))
+                refined["raw_text"] = data.get("raw_text", "") + " [CORRECTION] " + correction_text
+                refined["verify_tts_path"] = tts_path
+                st.session_state.ai_data = refined
+                st.session_state.stage = "verify"
+                st.rerun()
+            else:
+                st.warning("Couldn't hear the correction. Please try again.")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# STAGE: re_record — citizen denied, re-record with context preserved
+# ═══════════════════════════════════════════════════════════════════════════
+elif st.session_state.stage == "re_record":
+    data = st.session_state.ai_data or {}
+    if not data:
+        _reset()
+        st.rerun()
+
+    # Show what went wrong
+    st.markdown(f'''<div style="background:rgba(232,68,90,0.08);border:1px solid rgba(232,68,90,0.2);border-radius:12px;padding:14px 18px;margin-bottom:20px;display:flex;align-items:center;gap:8px;">
+        <span style="color:var(--accent-red);">❌</span>
+        <span style="font-size:14px;font-weight:700;color:var(--accent-red) !important;">Not Correct — Please Re-explain</span>
+    </div>''', unsafe_allow_html=True)
+
+    st.markdown(f'''<div class="card" style="border-left:3px solid var(--accent-red);">
+        <span class="section-label">AI's Wrong Understanding</span>
+        <h3 style="font-weight:600;margin:4px 0 0 0;text-decoration:line-through;color:var(--text-muted) !important;">{data.get('normalized_issue', '—')}</h3>
+    </div>''', unsafe_allow_html=True)
+
+    st.markdown('''<div class="card">
+        <span class="section-label">What to do</span>
+        <p style="color:var(--text-secondary) !important;margin:4px 0 0 0;">Please re-explain your issue. The AI will try again with more context.</p>
+    </div>''', unsafe_allow_html=True)
+
+    retry_audio = st.audio_input("🎙️ Re-explain your issue...", key="retry_mic")
+    if retry_audio is not None:
+        with open("retry.wav", "wb") as f:
+            f.write(retry_audio.getvalue())
+
+        with st.spinner("🔄 Re-analyzing with your feedback..."):
+            retry_text, _, _ = transcribe_audio("retry.wav")
+            if retry_text.strip():
+                refined = re_analyze_transcript(retry_text, data, feedback_type="denied")
+                tts_path = generate_tts(refined.get("verification_prompt", ""), refined.get("language", "kn"))
+                refined["raw_text"] = retry_text
+                refined["verify_tts_path"] = tts_path
+                st.session_state.ai_data = refined
+                st.session_state.stage = "verify"
+                st.rerun()
+            else:
+                st.warning("Couldn't hear you. Please try again.")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # STAGE: decision (transient — routes immediately)
@@ -306,12 +417,34 @@ elif st.session_state.stage == "agent_ready":
     </div>''', unsafe_allow_html=True)
 
     raw_transcript = data.get("raw_text", "")
-    st.markdown(f'''<div style="background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: 12px; padding: 20px; margin-top: 16px;">
-        <span class="section-label">📄 Raw Transcript</span>
-        <p style="font-family: 'Space Mono', monospace; font-size: 14px; line-height: 1.5; color: var(--text-secondary) !important; margin-top: 8px; white-space: pre-wrap; word-break: break-word;">
-            {raw_transcript}
-        </p>
-    </div>''', unsafe_allow_html=True)
+    original_transcript = data.get("original_text", "")
+    lang = data.get("language", "en")
+    lang_label = {"kn": "ಕನ್ನಡ (Kannada)", "hi": "हिन्दी (Hindi)"}.get(lang, lang.upper())
+
+    if original_transcript:
+        # Side-by-side: original language + English
+        st.markdown(f'''<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px;">
+            <div style="background:var(--bg-surface);border:1px solid var(--border-subtle);border-left:3px solid var(--accent-blue);border-radius:12px;padding:20px;">
+                <span class="section-label">🗣️ Original ({lang_label})</span>
+                <p style="font-family:'Space Mono',monospace;font-size:13px;line-height:1.6;color:var(--text-secondary) !important;margin-top:8px;white-space:pre-wrap;word-break:break-word;">
+                    {original_transcript}
+                </p>
+            </div>
+            <div style="background:var(--bg-surface);border:1px solid var(--border-subtle);border-left:3px solid var(--accent-green);border-radius:12px;padding:20px;">
+                <span class="section-label">📄 English Translation</span>
+                <p style="font-family:'Space Mono',monospace;font-size:13px;line-height:1.6;color:var(--text-secondary) !important;margin-top:8px;white-space:pre-wrap;word-break:break-word;">
+                    {raw_transcript}
+                </p>
+            </div>
+        </div>''', unsafe_allow_html=True)
+    else:
+        # Fallback: single transcript (English only)
+        st.markdown(f'''<div style="background:var(--bg-surface);border:1px solid var(--border-subtle);border-radius:12px;padding:20px;margin-top:16px;">
+            <span class="section-label">📄 Raw Transcript</span>
+            <p style="font-family:'Space Mono',monospace;font-size:14px;line-height:1.5;color:var(--text-secondary) !important;margin-top:8px;white-space:pre-wrap;word-break:break-word;">
+                {raw_transcript}
+            </p>
+        </div>''', unsafe_allow_html=True)
 
     agent_note = st.text_area(
         "Agent Notes / Corrections",
